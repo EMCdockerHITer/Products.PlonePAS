@@ -34,7 +34,11 @@ from Products.PluggableAuthService.interfaces.plugins import \
     IUserEnumerationPlugin
 from zope.event import notify
 import logging
-
+from emc.policy.events import CreateMemberEvent
+from emc.policy.events import ChangeMemberEvent
+from emc.policy.events import DeleteMemberEvent
+from emc.policy import get_ip,fmt,list2str,getfullname_orid
+import datetime
 logger = logging.getLogger('PlonePAS')
 
 registerToolInterface('acl_users', IPluggableAuthService)
@@ -97,8 +101,31 @@ def _doAddUser(self, login, password, roles, domains, groups=None, **kw):
     """Masking of PAS._doAddUser to add groups param."""
     _old_doAddUser = getattr(self, getattr(_doAddUser, ORIG_NAME))
     retval = _old_doAddUser(login, password, roles, domains)
+    mtool = getToolByName(self, 'portal_membership')
+    current = mtool.getAuthenticatedMember()
+    ucurrent =  getfullname_orid(current)
+    if not bool(ucurrent): return retval
+    descrip = ""
+    if bool(retval):
+        if len(roles)!=0:
+            dsn = list2str(roles)
+            descrip = u",并指派了%s角色" % dsn
+            
     if groups is not None:
         _userSetGroups(self, login, groups)
+        dsn = list2str(groups)
+        if bool(descrip):descrip=u",并分配了(%s)组(%s)" % (dsn,descrip)
+        else:
+            descrip=u",并分配了(%s)组" % dsn
+    crtEvent = CreateMemberEvent(adminid = ucurrent,
+                                     userid = login,
+                                     datetime = datetime.datetime.now().strftime(fmt),
+                                     ip = get_ip(),
+                                     type = 0,
+                                     description = descrip,
+                                     result = 1)
+    if crtEvent.available():
+        notify(crtEvent)        
     return retval
 
 
@@ -116,6 +143,8 @@ def _doDelUser(self, id):
     Given a user id, hand off to a deleter plugin if available.
     """
     plugins = self._getOb('plugins')
+    mtool = getToolByName(self, 'portal_membership')
+    current = mtool.getAuthenticatedMember()  
     userdeleters = plugins.listPlugins(IUserManagement)
 
     if not userdeleters:
@@ -125,11 +154,21 @@ def _doDelUser(self, id):
 
     for userdeleter_id, userdeleter in userdeleters:
         try:
+            user = mtool.getMemberById(id)
             userdeleter.doDeleteUser(id)
         except _SWALLOWABLE_PLUGIN_EXCEPTIONS:
             pass
         else:
             notify(PrincipalDeleted(id))
+            delEvent = DeleteMemberEvent(adminid = getfullname_orid(current),
+                                     userid = user.getProperty('fullname',user.getId()),
+                                     datetime = datetime.datetime.now().strftime(fmt),
+                                     ip = get_ip(),
+                                     type = 0,
+                                     description = "delete user",
+                                     result = 1)
+            if delEvent.available():
+                notify(delEvent)
 
 
 def _doChangeUser(self, principal_id, password, roles, domains=(), groups=None,
@@ -142,8 +181,24 @@ def _doChangeUser(self, principal_id, password, roles, domains=(), groups=None,
     """
     # Might be called with 'None' as password from the Plone UI, in
     # prefs_users_overview when resetPassword is not set.
+    mtool = getToolByName(self, 'portal_membership')
+    current = mtool.getAuthenticatedMember()
+    guest =   mtool.getMemberById(principal_id)  
     if password is not None:
-        self.userSetPassword(principal_id, password)
+        try:
+            self.userSetPassword(principal_id, password)
+        except:
+            pass
+        else:
+            chgEvent = ChangeMemberEvent(adminid = getfullname_orid(current),
+                                     userid = getfullname_orid(guest),
+                                     datetime = datetime.datetime.now().strftime(fmt),
+                                     ip = get_ip(),
+                                     type = 0,
+                                     description = u"更新密码",
+                                     result = 1)
+            if chgEvent.available():
+                notify(chgEvent)
 
     plugins = self._getOb('plugins')
     rmanagers = plugins.listPlugins(IRoleAssignerPlugin)
@@ -151,11 +206,30 @@ def _doChangeUser(self, principal_id, password, roles, domains=(), groups=None,
     if not (rmanagers):
         raise NotImplementedError("There is no plugin that can modify roles")
 
-    for rid, rmanager in rmanagers:
-        rmanager.assignRolesToPrincipal(roles, principal_id)
+    if bool(roles):
+        dsn = list2str(roles)
+        for rid, rmanager in rmanagers:
+            rmanager.assignRolesToPrincipal(roles, principal_id)
+            chgEvent = ChangeMemberEvent(adminid = getfullname_orid(current),
+                                     userid = getfullname_orid(guest),
+                                     datetime = datetime.datetime.now().strftime(fmt),
+                                     ip = get_ip(),
+                                     type = 0,
+                                     description = u"并更新了角色%s" % dsn,
+                                     result = 1)
+            if chgEvent.available():
+                notify(chgEvent)
 
     if groups is not None:
         _userSetGroups(self, principal_id, groups)
+        dsn = list2str(groups)
+        notify(ChangeMemberEvent(adminid = current.getProperty('fullname',current.getId()),
+                                     userid = getfullname_orid(guest),
+                                     datetime = datetime.datetime.now().strftime(fmt),
+                                     ip = get_ip(),
+                                     type = 0,
+                                     description = u"并更新了组%s" % dsn,
+                                     result = 1))        
 
     return True
 
